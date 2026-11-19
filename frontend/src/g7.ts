@@ -1,0 +1,287 @@
+// Dexcom G7 / ONE+ / Stelo direct Bluetooth reader.
+// Works like Loop's G7SensorKit and xDrip4iOS: the official Dexcom app stays installed and handles
+// starting the sensor and its security handshake. This app connects to the same sensor and listens to
+// the glucose message the sensor sends every 5 minutes.
+import { useSyncExternalStore } from "react";
+
+import { api } from "./api";
+import { bleSupported, getManager } from "./ble";
+import { queryClient } from "./query-client";
+
+export const G7 = {
+  ADVERTISEMENT: "FEBC",
+  CGM: "F8083532-849E-531C-C594-30F1F86A4EA5",
+  CONTROL: "F8083534-849E-531C-C594-30F1F86A4EA5",
+  AUTH: "F8083535-849E-531C-C594-30F1F86A4EA5",
+  BACKFILL: "F8083536-849E-531C-C594-30F1F86A4EA5",
+};
+
+export type G7Status = {
+  state: "idle" | "searching" | "connected" | "error";
+  message: string;
+  deviceName?: string;
+  lastValue?: number;
+  lastReadingAt?: number;
+  sensorState?: string;
+  scanEndsAt?: number; // set while a "Scan now" is running
+};
+
+let status: G7Status = { state: "idle", message: "Not started" };
+const listeners = new Set<() => void>();
+const setStatus = (p: Partial<G7Status>) => {
+  status = { ...status, ...p };
+  listeners.forEach((l) => l());
+};
+export const useG7Status = () =>
+  useSyncExternalStore(
+    (l) => {
+      listeners.add(l);
+      return () => listeners.delete(l);
+    },
+    () => status,
+  );
+
+const STATES: Record<number, string> = {
+  1: "Sensor stopped",
+  2: "Sensor warming up",
+  3: "Sensor signal noisy",
+  6: "OK",
+  15: "Session expired",
+  18: "Temporary sensor issue",
+  24: "Sensor expired",
+  25: "Sensor failed",
+  26: "Session ended",
+};
+
+const fromBase64 = (b64: string) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+
+function trendToDirection(t: number | null): string {
+  if (t === null) return "NONE";
+  if (t <= -3) return "DoubleDown";
+  if (t <= -2) return "SingleDown";
+  if (t <= -1) return "FortyFiveDown";
+  if (t < 1) return "Flat";
+  if (t < 2) return "FortyFiveUp";
+  if (t < 3) return "SingleUp";
+  return "DoubleUp";
+}
+
+// Byte layout from LoopKit G7SensorKit (G7GlucoseMessage):
+// 0:0x4E 1:status 2-5:timestamp 6-7:sequence 10-11:age(s) 12-13:glucose 14:algorithm state 15:trend 16-17:predicted
+export function parseG7Glucose(bytes: Uint8Array, receivedAt: number) {
+  if (bytes.length < 19 || bytes[0] !== 0x4e || bytes[1] !== 0) return null;
+  const u16 = (i: number) => bytes[i] | (bytes[i + 1] << 8);
+  const algorithm = bytes[14];
+  const raw = u16(12);
+  const trendByte = bytes[15];
+  const trend = trendByte === 0x7f ? null : ((trendByte << 24) >> 24) / 10;
+  return {
+    sequence: u16(6),
+    algorithm,
+    // bytes 2-5: seconds since the sensor was started -> sensor start time
+    activatedAt: new Date(receivedAt - (bytes[2] | (bytes[3] << 8) | (bytes[4] << 16) | ((bytes[5] << 24) >>> 0)) * 1000),
+    sgv: raw === 0xffff || algorithm !== 6 ? null : raw & 0xfff,
+    ts: new Date(receivedAt - u16(10) * 1000).toISOString(),
+    direction: trendToDirection(trend),
+  };
+}
+
+let running = false;
+let connecting = false;
+let activationHandler: ((d: Date) => void) | null = null;
+export const setG7ActivationHandler = (fn: (d: Date) => void) => {
+  activationHandler = fn;
+};
+// The sensor reports when its session is over (expired, ended, failed); the app then clears the session by itself, like xDrip+.
+const END_STATES = [15, 24, 25, 26];
+let endHandler: ((activatedAt: Date, state: string) => void) | null = null;
+let endedFor = 0;
+export const setG7EndHandler = (fn: ((activatedAt: Date, state: string) => void) | null) => {
+  endHandler = fn;
+};
+let timer: ReturnType<typeof setTimeout> | null = null;
+let subs: { remove: () => void }[] = [];
+let pending: { ts: string; sgv: number; direction: string }[] = [];
+let lastSequence = -1;
+let activatedAtMs = 0;
+
+// Backfill record (LoopKit G7BackfillMessage), sent when the Dexcom app asks the sensor for readings it missed:
+// 0-3: seconds since sensor start (24 bit) 4-5: glucose (12 bit) 6: algorithm state 7: flags 8: trend (signed, /10)
+export function parseG7Backfill(bytes: Uint8Array, activatedAt: number) {
+  if (bytes.length < 9 || !activatedAt) return null;
+  const secs = bytes[0] | (bytes[1] << 8) | (bytes[2] << 16);
+  const raw = bytes[4] | (bytes[5] << 8);
+  const glucose = raw & 0xfff;
+  if (bytes[6] !== 6 || raw === 0xffff || glucose < 39 || glucose > 401) return null;
+  const trend = bytes[8] === 0x7f ? null : ((bytes[8] << 24) >> 24) / 10;
+  return { ts: new Date(activatedAt + secs * 1000).toISOString(), sgv: glucose, direction: trendToDirection(trend) };
+}
+
+function onBackfill(b64: string | null | undefined) {
+  if (!b64) return;
+  const r = parseG7Backfill(fromBase64(b64), activatedAtMs);
+  if (!r || pending.some((p) => p.ts === r.ts)) return;
+  pending.push(r);
+  // backfill arrives as a quick burst; send it together
+  if (backfillTimer) clearTimeout(backfillTimer);
+  backfillTimer = setTimeout(flush, 3000);
+}
+let backfillTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function flush() {
+  if (!pending.length) return;
+  const batch = pending;
+  pending = [];
+  try {
+    await api("/readings/batch", { method: "POST", body: { readings: batch } });
+    queryClient.invalidateQueries({ queryKey: ["status"] });
+    queryClient.invalidateQueries({ queryKey: ["readings"] });
+  } catch {
+    pending = [...batch, ...pending].slice(-500); // keep for the next try (offline)
+  }
+}
+
+function onControl(b64: string | null | undefined) {
+  if (!b64) return;
+  const msg = parseG7Glucose(fromBase64(b64), Date.now());
+  if (!msg || msg.sequence === lastSequence) return;
+  lastSequence = msg.sequence;
+  activatedAtMs = msg.activatedAt.getTime();
+  setStatus({ sensorState: STATES[msg.algorithm] ?? `State ${msg.algorithm}` });
+  if (END_STATES.includes(msg.algorithm)) {
+    if (endedFor !== activatedAtMs) {
+      endedFor = activatedAtMs;
+      endHandler?.(msg.activatedAt, STATES[msg.algorithm] ?? `State ${msg.algorithm}`);
+    }
+    return;
+  }
+  activationHandler?.(msg.activatedAt);
+  if (msg.sgv === null) return;
+  pending.push({ ts: msg.ts, sgv: msg.sgv, direction: msg.direction });
+  setStatus({ lastValue: msg.sgv, lastReadingAt: Date.now() });
+  flush();
+}
+
+function clearSubs() {
+  subs.forEach((s) => s.remove());
+  subs = [];
+}
+
+async function connect(id: string) {
+  if (connecting || !running) return;
+  connecting = true;
+  const m = getManager();
+  try {
+    m.stopDeviceScan();
+    let device;
+    try {
+      device = await m.connectToDevice(id, { timeout: 15000 });
+    } catch (e) {
+      if (!(await m.isDeviceConnected(id))) throw e;
+      device = (await m.devices([id]))[0];
+    }
+    await device.discoverAllServicesAndCharacteristics();
+    clearSubs();
+    for (const ch of [G7.AUTH, G7.CONTROL, G7.BACKFILL]) {
+      subs.push(
+        device.monitorCharacteristicForService(G7.CGM, ch, (err: any, c: any) => {
+          if (!err && ch === G7.CONTROL) onControl(c?.value);
+          if (!err && ch === G7.BACKFILL) onBackfill(c?.value);
+        }),
+      );
+    }
+    subs.push(
+      m.onDeviceDisconnected(id, () => {
+        clearSubs();
+        // The disconnect event itself wakes the JS context even in the background (we already
+        // declare the bluetooth-central mode for this), so restart scanning right away instead of
+        // waiting for the next 30-second loop() tick, which may be delayed indefinitely if the
+        // timer isn't ticking while backgrounded.
+        beginScan(currentSavedId);
+      }),
+    );
+    setStatus({ state: "connected", message: "Connected, listening", deviceName: device.name ?? device.localName ?? "G7" });
+    flush();
+  } catch {
+    setStatus({ state: "searching", message: "Waiting for the sensor (it wakes every 5 minutes)" });
+  } finally {
+    connecting = false;
+  }
+}
+
+function beginScan(savedId?: string) {
+  if (!running) return;
+  const m = getManager();
+  setStatus({ state: "searching", message: "Searching for your G7" });
+  m.startDeviceScan([G7.ADVERTISEMENT], null, (err: any, d: any) => {
+    const name: string = d?.localName ?? d?.name ?? "";
+    if (!err && d && name.startsWith("DXCM") && (!savedId || d.id === savedId)) connect(d.id);
+  });
+}
+
+async function loop(savedId?: string) {
+  if (!running) return;
+  const m = getManager();
+  const state = await m.state();
+  if (state === "Unauthorized") setStatus({ state: "error", message: "Allow Bluetooth for GlucoShadow in iPhone Settings" });
+  else if (state !== "PoweredOn") setStatus({ state: "error", message: "Bluetooth is off" });
+  else if (status.state !== "connected") {
+    // Already connected by the Dexcom app? iOS lets us share that connection.
+    const connected = await m.connectedDevices([G7.CGM]).catch(() => []);
+    const match = connected.find((d: any) => !savedId || d.id === savedId);
+    if (match) await connect(match.id);
+    else beginScan(savedId);
+  }
+  flush();
+  timer = setTimeout(() => loop(savedId), 30000);
+}
+
+let currentSavedId: string | undefined;
+
+export function startG7(savedId?: string) {
+  if (!bleSupported || running) return;
+  running = true;
+  currentSavedId = savedId;
+  loop(savedId);
+}
+
+export const SCAN_NOW_SECONDS = 345; // 5 minutes 45 seconds, long enough to catch a sensor that only wakes every 5 minutes
+let scanTicker: ReturnType<typeof setInterval> | null = null;
+
+function endScan(message: string) {
+  if (scanTicker) clearInterval(scanTicker);
+  scanTicker = null;
+  if (status.state !== "connected") getManager()?.stopDeviceScan();
+  setStatus({ scanEndsAt: undefined, ...(status.state === "connected" ? {} : { state: "searching" as const, message }) });
+}
+
+/** "Scan now": listens for the sensor for 5:45 and connects as soon as it is heard. */
+export async function scanNow(savedId?: string) {
+  if (!bleSupported || scanTicker) return;
+  startG7(savedId);
+  const m = getManager();
+  const state = await m.state();
+  if (state !== "PoweredOn") return setStatus({ state: "error", message: state === "Unauthorized" ? "Allow Bluetooth for GlucoShadow in Settings" : "Bluetooth is off" });
+  const endsAt = Date.now() + SCAN_NOW_SECONDS * 1000;
+  setStatus({ scanEndsAt: endsAt, ...(status.state === "connected" ? {} : { state: "searching" as const, message: "Scanning for your sensor" }) });
+  if (status.state !== "connected") {
+    m.startDeviceScan([G7.ADVERTISEMENT], null, (err: any, d: any) => {
+      const name: string = d?.localName ?? d?.name ?? "";
+      if (!err && d && name.startsWith("DXCM") && (!savedId || d.id === savedId)) connect(d.id);
+    });
+  }
+  scanTicker = setInterval(() => {
+    if (Date.now() >= endsAt || !running) endScan("Scan finished. Still looking in the background.");
+    else setStatus({}); // refresh the countdown
+  }, 1000);
+}
+
+export function stopG7() {
+  if (scanTicker) clearInterval(scanTicker);
+  scanTicker = null;
+  running = false;
+  if (timer) clearTimeout(timer);
+  clearSubs();
+  getManager()?.stopDeviceScan();
+  setStatus({ state: "idle", message: "Stopped" });
+}

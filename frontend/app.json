@@ -1,0 +1,136 @@
+{
+  "expo": {
+    "name": "GlucoShadow",
+    "slug": "glucoshadow",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "glucoshadow",
+    "userInterfaceStyle": "automatic",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "org.glucoshadow.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Send your location to emergency contacts during lows",
+        "NSBluetoothAlwaysUsageDescription": "Connect to your glucose sensor for live readings",
+        "NSContactsUsageDescription": "Pick emergency contacts from your address book"
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "backgroundColor": "#000000"
+      },
+      "package": "org.glucoshadow.app",
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "BLUETOOTH_SCAN",
+        "BLUETOOTH_CONNECT",
+        "NFC",
+        "SEND_SMS",
+        "POST_NOTIFICATIONS",
+        "VIBRATE",
+        "WAKE_LOCK",
+        "RECEIVE_BOOT_COMPLETED",
+        "REQUEST_IGNORE_BATTERY_OPTIMIZATIONS",
+        "ACCESS_NOTIFICATION_POLICY",
+        "SCHEDULE_EXACT_ALARM",
+        "USE_EXACT_ALARM",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_CONNECTED_DEVICE",
+        "READ_CONTACTS"
+      ]
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single",
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/splash-image.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#000000"
+        }
+      ],
+      "expo-font",
+      "expo-image",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Choose a profile picture, or a photo of a sensor setup QR code, from your photos."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Scan the sensor setup QR code"
+        }
+      ],
+      "expo-secure-store",
+      "expo-web-browser",
+      "expo-status-bar",
+      "@react-native-vector-icons/ionicons",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Send your location to emergency contacts during lows"
+        }
+      ],
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": true,
+          "modes": [
+            "central"
+          ],
+          "bluetoothAlwaysPermission": "Connect to your glucose sensor for live readings"
+        }
+      ],
+      [
+        "expo-contacts",
+        {
+          "contactsPermission": "Pick emergency contacts from your address book"
+        }
+      ],
+      "expo-audio",
+      [
+        "expo-notifications",
+        {
+          "sounds": [
+            "./assets/sounds/classic.wav",
+            "./assets/sounds/chime.wav",
+            "./assets/sounds/siren.wav",
+            "./assets/sounds/pulse.wav",
+            "./assets/sounds/gentle.wav",
+            "./assets/sounds/alert.wav"
+          ]
+        }
+      ],
+      [
+        "react-native-nfc-manager",
+        {
+          "nfcPermission": "Scan your Libre sensor to start live readings",
+          "selectIdentifiers": [],
+          "includeNdefEntitlement": false
+        }
+      ],
+      [
+        "@kingstinct/react-native-healthkit",
+        {
+          "NSHealthShareUsageDescription": "Read glucose you saved to Apple Health",
+          "NSHealthUpdateUsageDescription": "Save your glucose readings to Apple Health",
+          "background": false
+        }
+      ]
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
